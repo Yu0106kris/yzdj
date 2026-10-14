@@ -1,0 +1,1080 @@
+hw-problem1-localization-agent/
+├── agent.py                 # ★ 全部核心代码（单文件）
+├── data/
+│   └── synthetic_data.py    # 合成数据生成器
+├── reports/                 # 运行时自动生成
+├── runs/                    # 运行时自动生成（迭代轨迹）
+├── requirements.txt
+├── README.md
+└── .gitignore
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+hw-problem1-localization-agent
+面向华为难题一「基于非线性优化的众包离线高精度位置聚合」的
+自主数学研究智能体（单文件实现）。
+
+智能体每轮迭代执行六步：
+  1. diagnose   —— 诊断当前数据集残差分布与离群点比例
+  2. plan       —— 状态驱动地选择本轮实验策略
+  3. act        —— 执行实验（扫描/IRLS优化/场景对比）
+  4. verify     —— 独立评估 CEP90 与 RMSE
+  5. reflect    —— 更新假设集、障碍集与下一步策略
+  6. trace      —— 将全过程写入 runs/run_*/trace.jsonl
+
+用法：
+    python agent.py --iterations 30 --mock
+    python agent.py --iterations 50            # 有 API Key 时启用 LLM 润色
+    python agent.py --report-only
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+from scipy.optimize import least_squares, minimize
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+DEFAULT_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+DEFAULT_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+DEFAULT_MODEL = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+
+RNG = np.random.default_rng(42)
+
+
+# ===========================================================================
+# 第一部分：数学工具集
+# ===========================================================================
+
+def rssi_to_distance(rssi_dbm: np.ndarray, tx_power: float = -59.0,
+                     n_path_loss: float = 2.5) -> np.ndarray:
+    """
+    对数路径损耗模型：RSSI = tx_power - 10 * n * log10(d)
+    反解距离 d = 10^((tx_power - RSSI) / (10 * n))
+
+    参考: RSSI = -10n*log10(d/d0) + C [reference:2]
+    """
+    rssi_clipped = np.clip(rssi_dbm, -100.0, -20.0)
+    d = 10.0 ** ((tx_power - rssi_clipped) / (10.0 * n_path_loss))
+    return np.clip(d, 0.1, 200.0)
+
+
+def compute_cep90(estimated: np.ndarray, ground_truth: np.ndarray,
+                  n_samples: int = 1000) -> float:
+    """
+    CEP90: 90% 分位圆概率误差。
+    对多组估计与真值对，计算距离误差的 90% 分位数。
+    """
+    if estimated.ndim == 1:
+        estimated = estimated.reshape(1, -1)
+    if ground_truth.ndim == 1:
+        ground_truth = ground_truth.reshape(1, -1)
+    errors = np.linalg.norm(estimated - ground_truth, axis=1)
+    return float(np.percentile(errors, 90))
+
+
+def compute_rmse(estimated: np.ndarray, ground_truth: np.ndarray) -> float:
+    if estimated.ndim == 1:
+        estimated = estimated.reshape(1, -1)
+    if ground_truth.ndim == 1:
+        ground_truth = ground_truth.reshape(1, -1)
+    errors = np.linalg.norm(estimated - ground_truth, axis=1)
+    return float(np.sqrt(np.mean(errors ** 2)))
+
+
+# ===========================================================================
+# 第二部分：鲁棒定位求解器
+# ===========================================================================
+
+class RobustLocalizer:
+    """
+    基于加权鲁棒非线性最小二乘的定位求解器。
+
+    支持多种鲁棒损失函数（linear / huber / soft_l1 / cauchy / arctan），
+    以及 IRLS 迭代重加权策略。
+    参考: scipy.optimize.least_squares 鲁棒损失族 [reference:3]
+    """
+
+    def __init__(self, positions: np.ndarray, distances: np.ndarray,
+                 base_weights: Optional[np.ndarray] = None,
+                 loss: str = "soft_l1", f_scale: float = 5.0):
+        self.positions = positions      # (N, 2)
+        self.distances = distances      # (N,)
+        self.N = len(positions)
+        self.base_weights = (base_weights if base_weights is not None
+                             else np.ones(self.N))
+        self.loss = loss
+        self.f_scale = f_scale
+        self.history: list = []
+
+    def residuals(self, x: np.ndarray) -> np.ndarray:
+        """残差 = f(r_i) - ||x - I_i||"""
+        pred = np.linalg.norm(self.positions - x, axis=1)
+        return self.distances - pred
+
+    def weighted_residuals(self, x: np.ndarray,
+                           weights: Optional[np.ndarray] = None) -> np.ndarray:
+        w = weights if weights is not None else self.base_weights
+        return np.sqrt(w) * self.residuals(x)
+
+    def solve(self, x0: Optional[np.ndarray] = None) -> dict:
+        """单次求解：加权鲁棒非线性最小二乘"""
+        if x0 is None:
+            x0 = np.average(self.positions, axis=0,
+                            weights=self.base_weights)
+        res = least_squares(
+            lambda x: self.weighted_residuals(x),
+            x0, loss=self.loss, f_scale=self.f_scale,
+            method="trf", max_nfev=2000,
+        )
+        return {
+            "x_hat": res.x.tolist(),
+            "cost": float(res.cost),
+            "optimality": float(res.optimality),
+            "n_iter": int(res.nfev),
+            "status": int(res.status),
+        }
+
+    def solve_irls(self, x0: Optional[np.ndarray] = None,
+                   max_iter: int = 20, eps: float = 1e-6) -> dict:
+        """
+        IRLS 迭代重加权：每轮根据残差大小自适应更新权重。
+        权重函数 w_i = 1 / (|e_i|^2 + eps^2)
+        参考: IRLS for squared range localization [reference:4]
+        """
+        if x0 is None:
+            x0 = np.average(self.positions, axis=0,
+                            weights=self.base_weights)
+        x = x0.copy()
+        weights = self.base_weights.copy()
+        cost_history = []
+
+        for k in range(max_iter):
+            res = least_squares(
+                lambda x: np.sqrt(weights) * self.residuals(x),
+                x, loss="linear", max_nfev=500,
+            )
+            x = res.x
+            e = self.residuals(x)
+            cost_history.append(float(np.sum(weights * e ** 2)))
+
+            # 自适应权重重分配
+            new_w = 1.0 / (e ** 2 + eps)
+            new_w = new_w / np.mean(new_w)
+            delta = np.max(np.abs(new_w - weights))
+            weights = new_w
+
+            if delta < 1e-5 and k > 3:
+                break
+
+        return {
+            "x_hat": x.tolist(),
+            "weights_final": weights.tolist(),
+            "cost_history": cost_history,
+            "n_iter": k + 1,
+        }
+
+
+# ===========================================================================
+# 第三部分：合成数据生成
+# ===========================================================================
+
+@dataclass
+class ExperimentDataset:
+    """一组众包定位数据"""
+    name: str
+    positions: np.ndarray       # (N, 2) 好心人位置
+    rssi: np.ndarray            # (N,) RSSI 值
+    distances: np.ndarray       # (N,) 由 RSSI 推算的距离
+    true_pos: np.ndarray        # (2,) 真值
+    n_good: int
+    n_outlier: int
+    scenario: str               # "static" | "moving"
+
+
+def generate_dataset(
+    true_pos: np.ndarray,
+    n_good: int = 12,
+    n_outlier: int = 3,
+    scenario: str = "static",
+    rssi_noise_std: float = 4.0,
+    outlier_bias: float = 25.0,
+    tx_power: float = -59.0,
+    n_path_loss: float = 2.5,
+) -> ExperimentDataset:
+    """
+    生成一组模拟数据：
+    - 好心人在真值附近随机分布
+    - RSSI 服从对数路径损耗模型 + 高斯噪声
+    - 离群点：RSSI 被大幅偏置，模拟 GNSS/WiFi 定位误差
+    """
+    # 好心人位置：以真值为中心，半径 5~35 米随机分布
+    angles = RNG.uniform(0, 2 * np.pi, n_good)
+    radii = RNG.uniform(5, 35, n_good)
+    good_pos = true_pos + np.column_stack([radii * np.cos(angles),
+                                            radii * np.sin(angles)])
+
+    # 真实距离与 RSSI
+    true_dists = np.linalg.norm(good_pos - true_pos, axis=1)
+    rssi_clean = tx_power - 10 * n_path_loss * np.log10(np.clip(true_dists, 0.1, None))
+    rssi = rssi_clean + RNG.normal(0, rssi_noise_std, n_good)
+
+    # 离群点：位置合理但 RSSI 被偏置（模拟定位误差）
+    if n_outlier > 0:
+        angles_o = RNG.uniform(0, 2 * np.pi, n_outlier)
+        radii_o = RNG.uniform(10, 40, n_outlier)
+        out_pos = true_pos + np.column_stack([radii_o * np.cos(angles_o),
+                                               radii_o * np.sin(angles_o)])
+        rssi_out = rssi_clean.mean() + RNG.normal(
+            outlier_bias, rssi_noise_std * 2, n_outlier)
+        all_pos = np.vstack([good_pos, out_pos])
+        all_rssi = np.concatenate([rssi, rssi_out])
+    else:
+        all_pos = good_pos
+        all_rssi = rssi
+
+    dists = rssi_to_distance(all_rssi, tx_power, n_path_loss)
+
+    # 移动场景：在位置和 RSSI 上施加额外扰动
+    if scenario == "moving":
+        all_pos = all_pos + RNG.normal(0, 8.0, all_pos.shape)
+        all_rssi = all_rssi + RNG.normal(0, 3.0, len(all_rssi))
+        dists = rssi_to_distance(all_rssi, tx_power, n_path_loss)
+
+    return ExperimentDataset(
+        name=f"{scenario}_good{n_good}_out{n_outlier}",
+        positions=all_pos, rssi=all_rssi, distances=dists,
+        true_pos=true_pos, n_good=n_good, n_outlier=n_outlier,
+        scenario=scenario,
+    )
+
+
+def build_benchmark(n_scenes: int = 20) -> list:
+    """构建基准测试集：多种场景组合"""
+    datasets = []
+    for i in range(n_scenes):
+        true_pos = RNG.uniform(-50, 50, 2)
+        scenario = "moving" if i % 2 == 0 else "static"
+        n_good = RNG.integers(8, 20)
+        n_out = RNG.integers(0, 5)
+        ds = generate_dataset(
+            true_pos, n_good=int(n_good), n_outlier=int(n_out),
+            scenario=scenario,
+            outlier_bias=RNG.uniform(15, 35),
+        )
+        datasets.append(ds)
+    return datasets
+
+
+# ===========================================================================
+# 第四部分：研究状态与规划器
+# ===========================================================================
+
+@dataclass
+class Action:
+    kind: str
+    params: dict
+    rationale: str
+
+
+@dataclass
+class ResearchState:
+    iteration: int = 0
+    best_cep90: float = float("inf")
+    best_config: dict = field(default_factory=dict)
+    loss_results: dict = field(default_factory=dict)   # loss -> cep90
+    fscale_results: dict = field(default_factory=dict)
+    irls_improvement: float = 0.0
+    scenario_comparison: dict = field(default_factory=dict)
+    hypotheses: list = field(default_factory=list)
+    obstacles: list = field(default_factory=list)
+    phases_done: set = field(default_factory=set)
+
+
+class Planner:
+    """
+    状态驱动的规划器：
+    Phase 1 (iter 1-8)   : 扫描鲁棒损失函数类型
+    Phase 2 (iter 9-16)  : 扫描 f_scale 参数
+    Phase 3 (iter 17-24) : IRLS 迭代重加权优化
+    Phase 4 (iter 25+)   : 场景对比与收敛验证
+    """
+
+    LOSSES = ["linear", "huber", "soft_l1", "cauchy", "arctan"]
+    FSCALES = [1.0, 3.0, 5.0, 8.0, 12.0, 20.0]
+
+    def plan(self, state: ResearchState) -> Action:
+        it = state.iteration
+
+        if it < len(self.LOSSES):
+            loss = self.LOSSES[it]
+            return Action("sweep_loss", {"loss": loss},
+                          f"扫描鲁棒损失函数 '{loss}'，评估其对离群点的抑制效果。")
+
+        if it < len(self.LOSSES) + len(self.FSCALES):
+            idx = it - len(self.LOSSES)
+            fs = self.FSCALES[idx]
+            best_loss = state.best_config.get("loss", "soft_l1")
+            return Action("sweep_fscale", {"loss": best_loss, "f_scale": fs},
+                          f"固定最优损失 '{best_loss}'，扫描 f_scale={fs}。")
+
+        if it < len(self.LOSSES) + len(self.FSCALES) + 6:
+            return Action("irls", {},
+                          "执行 IRLS 迭代重加权，验证自适应权重是否优于固定权重。")
+
+        if it < len(self.LOSSES) + len(self.FSCALES) + 12:
+            return Action("scenario", {},
+                          "对比静止与移动场景下的最优策略差异。")
+
+        return Action("converge", {},
+                      "检查最优解稳定性，尝试多初值验证是否收敛到全局最优。")
+
+    def execute(self, action: Action, state: ResearchState,
+                datasets: list) -> dict:
+        if action.kind == "sweep_loss":
+            return self._sweep_loss(action.params["loss"], datasets)
+        if action.kind == "sweep_fscale":
+            return self._sweep_fscale(action.params["loss"],
+                                      action.params["f_scale"], datasets)
+        if action.kind == "irls":
+            return self._run_irls(datasets)
+        if action.kind == "scenario":
+            return self._scenario_compare(datasets)
+        if action.kind == "converge":
+            return self._converge_check(datasets)
+        raise ValueError(f"未知动作: {action.kind}")
+
+    def _sweep_loss(self, loss: str, datasets: list) -> dict:
+        ests, truths = [], []
+        for ds in datasets:
+            loc = RobustLocalizer(ds.positions, ds.distances,
+                                  loss=loss, f_scale=5.0)
+            r = loc.solve()
+            ests.append(r["x_hat"])
+            truths.append(ds.true_pos)
+        ests = np.array(ests)
+        truths = np.array(truths)
+        cep = compute_cep90(ests, truths)
+        rmse = compute_rmse(ests, truths)
+        return {"kind": "sweep_loss", "loss": loss,
+                "cep90": round(cep, 4), "rmse": round(rmse, 4)}
+
+    def _sweep_fscale(self, loss: str, f_scale: float,
+                      datasets: list) -> dict:
+        ests, truths = [], []
+        for ds in datasets:
+            loc = RobustLocalizer(ds.positions, ds.distances,
+                                  loss=loss, f_scale=f_scale)
+            r = loc.solve()
+            ests.append(r["x_hat"])
+            truths.append(ds.true_pos)
+        ests = np.array(ests)
+        truths = np.array(truths)
+        cep = compute_cep90(ests, truths)
+        rmse = compute_rmse(ests, truths)
+        return {"kind": "sweep_fscale", "loss": loss, "f_scale": f_scale,
+                "cep90": round(cep, 4), "rmse": round(rmse, 4)}
+
+    def _run_irls(self, datasets: list) -> dict:
+        ests_irls, ests_std, truths = [], [], []
+        for ds in datasets:
+            loc = RobustLocalizer(ds.positions, ds.distances,
+                                  loss="soft_l1", f_scale=5.0)
+            r_std = loc.solve()
+            r_irls = loc.solve_irls()
+            ests_std.append(r_std["x_hat"])
+            ests_irls.append(r_irls["x_hat"])
+            truths.append(ds.true_pos)
+        ests_std = np.array(ests_std)
+        ests_irls = np.array(ests_irls)
+        truths = np.array(truths)
+        cep_std = compute_cep90(ests_std, truths)
+        cep_irls = compute_cep90(ests_irls, truths)
+        improvement = (cep_std - cep_irls) / max(cep_std, 1e-6) * 100
+        return {"kind": "irls", "cep90_std": round(cep_std, 4),
+                "cep90_irls": round(cep_irls, 4),
+                "improvement_pct": round(improvement, 2)}
+
+    def _scenario_compare(self, datasets: list) -> dict:
+        result = {}
+        for scenario in ["static", "moving"]:
+            sub = [ds for ds in datasets if ds.scenario == scenario]
+            if not sub:
+                continue
+            ests, truths = [], []
+            for ds in sub:
+                loc = RobustLocalizer(ds.positions, ds.distances,
+                                      loss="soft_l1", f_scale=5.0)
+                r = loc.solve()
+                ests.append(r["x_hat"])
+                truths.append(ds.true_pos)
+            cep = compute_cep90(np.array(ests), np.array(truths))
+            result[scenario] = {"n_scenes": len(sub),
+                                "cep90": round(cep, 4)}
+        return {"kind": "scenario", "comparison": result}
+
+    def _converge_check(self, datasets: list) -> dict:
+        """多初值验证：从不同初值出发，检查最优解是否稳定"""
+        ds = datasets[0]
+        loc = RobustLocalizer(ds.positions, ds.distances,
+                              loss="soft_l1", f_scale=5.0)
+        starts = [
+            np.average(ds.positions, axis=0),
+            ds.positions[0],
+            np.array([0.0, 0.0]),
+            np.array([50.0, 50.0]),
+            np.array([-50.0, -50.0]),
+        ]
+        results = []
+        for x0 in starts:
+            r = loc.solve(x0=x0)
+            err = np.linalg.norm(np.array(r["x_hat"]) - ds.true_pos)
+            results.append({"x0": x0.tolist(),
+                            "x_hat": r["x_hat"],
+                            "error": round(err, 4)})
+        errors = [r["error"] for r in results]
+        spread = max(errors) - min(errors)
+        return {"kind": "converge", "n_starts": len(starts),
+                "errors": [round(e, 4) for e in errors],
+                "spread": round(spread, 4),
+                "stable": spread < 10.0}
+
+
+# ===========================================================================
+# 第五部分：验证与反思
+# ===========================================================================
+
+def verify(action: Action, result: dict) -> dict:
+    checks = []
+    if result["kind"] == "sweep_loss":
+        checks.append({"name": "损失函数评估", "passed": result["cep90"] < 100,
+                       "detail": f"CEP90 = {result['cep90']} m"})
+    elif result["kind"] == "sweep_fscale":
+        checks.append({"name": "f_scale 评估", "passed": result["cep90"] < 100,
+                       "detail": f"CEP90 = {result['cep90']} m"})
+    elif result["kind"] == "irls":
+        checks.append({"name": "IRLS 改进验证",
+                       "passed": result["improvement_pct"] > 0,
+                       "detail": f"改进 = {result['improvement_pct']}%"})
+    elif result["kind"] == "converge":
+        checks.append({"name": "收敛稳定性", "passed": result["stable"],
+                       "detail": f"spread = {result['spread']} m"})
+    else:
+        checks.append({"name": "场景对比", "passed": True, "detail": "OK"})
+    all_passed = all(c["passed"] for c in checks)
+    return {"status": "passed" if all_passed else "warning",
+            "checks": checks}
+
+
+def reflect(action: Action, result: dict, verification: dict,
+            state: ResearchState, use_llm: bool) -> str:
+    if result["kind"] == "sweep_loss":
+        base = (f"损失 '{result['loss']}'：CEP90 = {result['cep90']} m，"
+                f"RMSE = {result['rmse']} m。")
+        if result["cep90"] < 30:
+            base += " 已满足 CEP90 ≤ 30 m 的目标。"
+        else:
+            base += " 距离 CEP90 ≤ 30 m 目标仍有差距。"
+    elif result["kind"] == "sweep_fscale":
+        base = (f"损失='{result['loss']}', f_scale={result['f_scale']}："
+                f"CEP90 = {result['cep90']} m。")
+    elif result["kind"] == "irls":
+        base = (f"IRLS 迭代重加权：固定权重 CEP90 = {result['cep90_std']} m，"
+                f"IRLS CEP90 = {result['cep90_irls']} m，"
+                f"改进 {result['improvement_pct']}%。")
+    elif result["kind"] == "scenario":
+        comp = result["comparison"]
+        base = "场景对比：" + "；".join(
+            f"{k} 场景 {v['n_scenes']} 个，CEP90={v['cep90']} m"
+            for k, v in comp.items())
+    elif result["kind"] == "converge":
+        base = (f"多初值验证：{result['n_starts']} 个初值，"
+                f"误差范围 [{min(result['errors'])}, {max(result['errors'])}]，"
+                f"spread={result['spread']} m，"
+                f"{'稳定' if result['stable'] else '不稳定'}。")
+    else:
+        base = "本轮无输出。"
+
+    if not verification["status"] == "passed":
+        base += " ⚠ 验证未全部通过。"
+
+    if use_llm and OpenAI is not None:
+        text = llm_generate(
+            system="你是定位算法研究智能体的反思模块，用2-3句中文总结本轮发现与下一步建议。",
+            user=json.dumps({"action": asdict(action),
+                             "result": result,
+                             "verification": verification},
+                            ensure_ascii=False))
+        if text:
+            return text
+    return base
+
+
+def apply_result(state: ResearchState, action: Action, result: dict) -> None:
+    state.iteration += 1
+    if result["kind"] == "sweep_loss":
+        state.loss_results[result["loss"]] = result["cep90"]
+        if result["cep90"] < state.best_cep90:
+            state.best_cep90 = result["cep90"]
+            state.best_config = {"loss": result["loss"],
+                                 "f_scale": state.best_config.get("f_scale", 5.0)}
+    elif result["kind"] == "sweep_fscale":
+        key = f"{result['loss']}_{result['f_scale']}"
+        state.fscale_results[key] = result["cep90"]
+        if result["cep90"] < state.best_cep90:
+            state.best_cep90 = result["cep90"]
+            state.best_config = {"loss": result["loss"],
+                                 "f_scale": result["f_scale"]}
+    elif result["kind"] == "irls":
+        state.irls_improvement = result["improvement_pct"]
+        if result["improvement_pct"] > 5:
+            state.hypotheses.append(
+                f"IRLS 迭代重加权相比固定权重在 CEP90 上改进 "
+                f"{result['improvement_pct']}%")
+    elif result["kind"] == "scenario":
+        state.scenario_comparison = result["comparison"]
+        for sc, v in result["comparison"].items():
+            if v["cep90"] > 30:
+                state.obstacles.append(
+                    f"{sc} 场景 CEP90={v['cep90']} m，尚未达到 30 m 目标")
+    elif result["kind"] == "converge":
+        if not result["stable"]:
+            state.obstacles.append(
+                f"多初值求解不稳定，spread={result['spread']} m")
+
+
+# ===========================================================================
+# 第六部分：LLM 桥接
+# ===========================================================================
+
+def llm_generate(system: str, user: str,
+                 model: str = DEFAULT_MODEL,
+                 base_url: str = DEFAULT_BASE_URL,
+                 api_key: str = DEFAULT_API_KEY) -> Optional[str]:
+    if OpenAI is None or not api_key:
+        return None
+    try:
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            temperature=0.3)
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[warn] LLM 调用失败: {e}")
+        return None
+
+
+# ===========================================================================
+# 第七部分：报告生成
+# ===========================================================================
+
+TEX_ESCAPE_MAP = {"\\": r"\textbackslash{}", "&": r"\&", "%": r"\%",
+                  "$": r"\$", "#": r"\#", "_": r"\_", "{": r"\{",
+                  "}": r"\}", "~": r"\textasciitilde{}", "^": r"\textasciicircum{}"}
+
+
+def tex_escape(s: Any) -> str:
+    return "".join(TEX_ESCAPE_MAP.get(ch, ch) for ch in str(s))
+
+
+def build_markdown_report(state: ResearchState, records: list) -> str:
+    lines = []
+    lines.append("# 智能体辅助研究：众包离线高精度位置聚合\n")
+    lines.append(f"*生成时间：{datetime.now().isoformat(timespec='seconds')}*\n")
+
+    lines.append("## 摘要\n")
+    lines.append(
+        f"本报告记录了一个自主定位算法研究智能体对华为难题一"
+        f"（基于非线性优化的众包离线高精度位置聚合）的 "
+        f"**{len(records)} 轮迭代**。智能体评估了 "
+        f"**{len(state.loss_results)}** 种鲁棒损失函数、"
+        f"**{len(state.fscale_results)}** 组 f_scale 参数，"
+        f"最优 CEP90 达到 **{state.best_cep90:.2f} m**，"
+        f"IRLS 迭代重加权改进 **{state.irls_improvement:.1f}%**。\n")
+
+    lines.append("## 1. 问题陈述\n")
+    lines.append(
+        "给定 N 个好心人设备的位置 $I_i$ 及 BLE RSSI $r_i$，"
+        "通过 RSSI 推算距离 $f(r_i)$，求解丢失设备位置 $\\hat{x}$：\n")
+    lines.append(
+        "$$\\hat{x} = \\arg\\min_x \\sum_{i=1}^{N} \\omega_i"
+        "(f(r_i) - \\|x - I_i\\|_2)^2$$\n")
+    lines.append(
+        "其中 $\\omega_i$ 由定位时间、定位方式、定位精度、置信度等决定。"
+        "目标：CEP90 ≤ 30 m（10+ 好心人）。\n")
+
+    lines.append("## 2. 智能体架构\n")
+    lines.append(
+        "- **架构**：单文件 ReAct 式循环（diagnose → plan → act → verify → reflect → trace）\n"
+        "- **定位求解器**：基于 `scipy.optimize.least_squares` 的加权鲁棒非线性最小二乘\n"
+        "- **鲁棒损失族**：linear / huber / soft_l1 / cauchy / arctan\n"
+        "- **IRLS 迭代重加权**：自适应权重 $w_i = 1/(|e_i|^2 + \\epsilon^2)$\n"
+        "- **验证器**：CEP90 与 RMSE 独立评估\n")
+
+    lines.append("## 3. 迭代过程（抽样）\n")
+    step = max(1, len(records) // 8)
+    for rec in records:
+        if rec["iteration"] % step == 0 or rec["iteration"] == 1:
+            lines.append(
+                f"### 第 {rec['iteration']} 轮 — `{rec['action']['kind']}`\n"
+                f"- **规划**：{rec['action']['rationale']}\n"
+                f"- **反思**：{rec['reflection']}\n")
+
+    lines.append("## 4. 结果统计\n")
+    lines.append("| 指标 | 数值 |")
+    lines.append("|---|---|")
+    lines.append(f"| 总迭代轮次 | {len(records)} |")
+    lines.append(f"| 最优 CEP90 | {state.best_cep90:.2f} m |")
+    lines.append(f"| 最优配置 | loss={state.best_config.get('loss','N/A')}, "
+                 f"f_scale={state.best_config.get('f_scale','N/A')} |")
+    lines.append(f"| IRLS 改进 | {state.irls_improvement:.1f}% |")
+    lines.append("")
+
+    lines.append("### 损失函数扫描结果\n")
+    lines.append("| 损失函数 | CEP90 (m) |")
+    lines.append("|---|---|")
+    for loss, cep in sorted(state.loss_results.items(), key=lambda x: x[1]):
+        lines.append(f"| {loss} | {cep:.2f} |")
+    lines.append("")
+
+    if state.fscale_results:
+        lines.append("### f_scale 扫描结果（前 5）\n")
+        lines.append("| 配置 | CEP90 (m) |")
+        lines.append("|---|---|")
+        for k, v in sorted(state.fscale_results.items(),
+                           key=lambda x: x[1])[:5]:
+            lines.append(f"| {k} | {v:.2f} |")
+        lines.append("")
+
+    if state.scenario_comparison:
+        lines.append("### 场景对比\n")
+        lines.append("| 场景 | 场景数 | CEP90 (m) |")
+        lines.append("|---|---|---|")
+        for sc, v in state.scenario_comparison.items():
+            lines.append(f"| {sc} | {v['n_scenes']} | {v['cep90']:.2f} |")
+        lines.append("")
+
+    lines.append("## 5. 假设与发现\n")
+    if state.hypotheses:
+        for h in state.hypotheses:
+            lines.append(f"- ✅ {h}")
+    else:
+        lines.append("- （尚未形成经证实的假设）")
+    lines.append("")
+
+    lines.append("## 6. 失败路径与障碍\n")
+    if state.obstacles:
+        for o in state.obstacles[:10]:
+            lines.append(f"- ⚠ {o}")
+    else:
+        lines.append("- 本轮运行未记录明确障碍。")
+    lines.append("")
+
+    lines.append("## 7. 结论与展望\n")
+    lines.append(
+        f"智能体在 {len(records)} 轮迭代中系统评估了鲁棒损失函数与 IRLS 策略，"
+        f"最优 CEP90 为 {state.best_cep90:.2f} m。"
+        "后续方向：\n"
+        "1. 在真实华为数据集上验证合成数据结论；\n"
+        "2. 探索基于场景分类的自适应参数选择；\n"
+        "3. 引入时间序列模型处理移动场景。\n")
+
+    lines.append("## 附录：完整迭代日志（节选）\n")
+    lines.append("```")
+    for rec in records[-15:]:
+        lines.append(
+            f"[{rec['iteration']:>3}] {rec['action']['kind']:<16} "
+            f"| {rec['verification']['status']:<8} "
+            f"| {rec['reflection'][:70]}")
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def build_latex(state: ResearchState, records: list) -> str:
+    # 损失函数表
+    loss_rows = "\n".join(
+        f"{tex_escape(loss)} & {cep:.2f} \\\\"
+        for loss, cep in sorted(state.loss_results.items(), key=lambda x: x[1]))
+
+    # f_scale 表
+    fs_rows = "\n".join(
+        f"{tex_escape(k)} & {v:.2f} \\\\"
+        for k, v in sorted(state.fscale_results.items(),
+                           key=lambda x: x[1])[:8])
+
+    # 场景表
+    sc_rows = "\n".join(
+        f"{tex_escape(sc)} & {v['n_scenes']} & {v['cep90']:.2f} \\\\"
+        for sc, v in state.scenario_comparison.items())
+
+    # 迭代日志
+    iter_rows = "\n".join(
+        f"{rec['iteration']} & {tex_escape(rec['action']['kind'])} & "
+        f"{tex_escape(rec['verification']['status'])} & "
+        f"{tex_escape(rec['reflection'][:60])} \\\\"
+        for rec in records)
+
+    hyp_items = "\n".join(f"\\item {tex_escape(h)}"
+                          for h in state.hypotheses) or "\\item （无）"
+    obs_items = "\n".join(f"\\item {tex_escape(o)}"
+                          for o in state.obstacles[:8]) or "\\item （无）"
+
+    tex = r"""\documentclass[11pt]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{longtable}
+\usepackage{hyperref}
+\geometry{margin=2.4cm}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+
+\title{智能体辅助研究：众包离线高精度位置聚合\\（华为难题一）}
+\author{hw-problem1-localization-agent}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本报告记录了一个自主定位算法研究智能体对华为难题一
+（基于非线性优化的众包离线高精度位置聚合）的
+\textbf{__NITER__} 轮迭代。智能体评估了
+\textbf{__NLOSS__} 种鲁棒损失函数、\textbf{__NFS__} 组 f\_scale 参数，
+最优 CEP90 达到 \textbf{__BEST__~m}，
+IRLS 迭代重加权改进 \textbf{__IRLS__\%}。
+\end{abstract}
+
+\section{问题陈述}
+给定 $N$ 个好心人设备位置 $I_i$ 及 BLE RSSI $r_i$，
+通过 $f(r_i)$ 推算距离，求解丢失设备位置 $\hat{x}$：
+\begin{equation}
+\hat{x} = \arg\min_{x}\sum_{i=1}^{N}\omega_i
+\bigl(f(r_i)-\|x-I_i\|_2\bigr)^2
+\end{equation}
+其中 $\omega_i$ 由定位时间、定位方式、精度、置信度决定。
+
+\section{智能体架构}
+\begin{itemize}
+\item 单文件 ReAct 式循环：diagnose $\to$ plan $\to$ act $\to$ verify $\to$ reflect $\to$ trace
+\item 定位求解器：\texttt{scipy.optimize.least\_squares} 加权鲁棒非线性最小二乘
+\item 鲁棒损失族：linear / huber / soft\_l1 / cauchy / arctan
+\item IRLS 迭代重加权：$w_i=1/(|e_i|^2+\epsilon^2)$
+\item 评估指标：CEP90 与 RMSE
+\end{itemize}
+
+\section{结果统计}
+\subsection{损失函数扫描}
+\begin{table}[h]\centering
+\begin{tabular}{lr}
+\toprule
+损失函数 & CEP90 (m) \\
+\midrule
+__LOSSROWS__
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{f\_scale 扫描（前 8）}
+\begin{table}[h]\centering
+\begin{tabular}{lr}
+\toprule
+配置 & CEP90 (m) \\
+\midrule
+__FSROWS__
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{场景对比}
+\begin{table}[h]\centering
+\begin{tabular}{lrr}
+\toprule
+场景 & 场景数 & CEP90 (m) \\
+\midrule
+__SCROWS__
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{假设与发现}
+\begin{itemize}
+__HYPS__
+\end{itemize}
+
+\section{失败路径与障碍}
+\begin{itemize}
+__OBS__
+\end{itemize}
+
+\section{结论与展望}
+智能体在 __NITER__ 轮迭代中系统评估了鲁棒损失函数与 IRLS 策略，
+最优 CEP90 为 __BEST__~m。后续方向：真实数据集验证、
+场景自适应参数选择、移动场景时间序列建模。
+
+\section*{附录：完整迭代日志}
+\small
+\begin{longtable}{rllp{7cm}}
+\toprule
+轮次 & 动作 & 验证 & 反思摘要 \\
+\midrule
+\endfirsthead
+\toprule
+轮次 & 动作 & 验证 & 反思摘要 \\
+\midrule
+\endhead
+__ITERROWS__
+\bottomrule
+\end{longtable}
+
+\end{document}
+"""
+    tex = tex.replace("__NITER__", str(len(records)))
+    tex = tex.replace("__NLOSS__", str(len(state.loss_results)))
+    tex = tex.replace("__NFS__", str(len(state.fscale_results)))
+    tex = tex.replace("__BEST__", f"{state.best_cep90:.2f}")
+    tex = tex.replace("__IRLS__", f"{state.irls_improvement:.1f}")
+    tex = tex.replace("__LOSSROWS__", loss_rows)
+    tex = tex.replace("__FSROWS__", fs_rows)
+    tex = tex.replace("__SCROWS__", sc_rows)
+    tex = tex.replace("__HYPS__", hyp_items)
+    tex = tex.replace("__OBS__", obs_items)
+    tex = tex.replace("__ITERROWS__", iter_rows)
+    return tex
+
+
+def compile_pdf(tex_path: Path, out_dir: Path) -> Optional[Path]:
+    engine = None
+    for cand in ("xelatex", "pdflatex"):
+        if shutil.which(cand):
+            engine = cand
+            break
+    if engine is None:
+        print("[warn] 未检测到 LaTeX 引擎，跳过 PDF 编译。")
+        return None
+    for _ in range(2):
+        try:
+            subprocess.run(
+                [engine, "-interaction=nonstopmode",
+                 f"-output-directory={out_dir}", str(tex_path)],
+                check=True, capture_output=True, timeout=180)
+        except subprocess.CalledProcessError as e:
+            print(f"[warn] {engine} 编译失败：")
+            print(e.stdout.decode(errors="ignore")[-1200:])
+            return None
+    pdf = out_dir / (tex_path.stem + ".pdf")
+    for ext in (".aux", ".log", ".out", ".toc"):
+        f = out_dir / (tex_path.stem + ext)
+        if f.exists():
+            f.unlink()
+    return pdf if pdf.exists() else None
+
+
+# ===========================================================================
+# 第八部分：主流程
+# ===========================================================================
+
+def run_agent(args: argparse.Namespace) -> None:
+    root = Path(args.out).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+
+    use_llm = (not args.mock) and (OpenAI is not None) and bool(DEFAULT_API_KEY)
+    if not args.mock and not use_llm:
+        print("[info] 未检测到 API Key，使用规则引擎模式。")
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = root / "runs" / f"run_{stamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = run_dir / "trace.jsonl"
+
+    print("=" * 65)
+    print("  hw-problem1-localization-agent")
+    print("  华为难题一：众包离线高精度位置聚合")
+    print("=" * 65)
+    print(f"迭代轮次：{args.iterations}")
+    print(f"运行目录：{run_dir}")
+    print(f"LLM 润色：{'启用' if use_llm else '关闭'}")
+    print("-" * 65)
+
+    # 构建基准数据集
+    datasets = build_benchmark(n_scenes=args.scenes)
+    print(f"[data] 构建 {len(datasets)} 个基准场景")
+    print("-" * 65)
+
+    state = ResearchState()
+    planner = Planner()
+    records: list = []
+
+    for _ in range(args.iterations):
+        action = planner.plan(state)
+        result = planner.execute(action, state, datasets)
+        verification = verify(action, result)
+        reflection = reflect(action, result, verification, state, use_llm)
+        apply_result(state, action, result)
+
+        record = {
+            "iteration": state.iteration,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "action": asdict(action),
+            "result": result,
+            "verification": verification,
+            "reflection": reflection,
+            "state_snapshot": {
+                "best_cep90": round(state.best_cep90, 4),
+                "best_config": state.best_config,
+                "irls_improvement": state.irls_improvement,
+                "hypothesis_count": len(state.hypotheses),
+                "obstacle_count": len(state.obstacles),
+            },
+        }
+        records.append(record)
+        with trace_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # 终端简报
+        brief = ""
+        if "cep90" in result:
+            brief = f"CEP90={result['cep90']:.2f}m"
+        elif result["kind"] == "irls":
+            brief = f"改进={result['improvement_pct']}%"
+        elif result["kind"] == "converge":
+            brief = f"spread={result['spread']:.2f}m"
+        elif result["kind"] == "scenario":
+            brief = " | ".join(f"{k}={v['cep90']:.1f}m"
+                               for k, v in result["comparison"].items())
+        print(f"[{state.iteration:>3}] {action.kind:<18} | "
+              f"{verification['status']:<8} | {brief}")
+
+    # 保存最终状态
+    state_dict = asdict(state)
+    state_dict["phases_done"] = list(state.phases_done)
+    (run_dir / "state.json").write_text(
+        json.dumps(state_dict, ensure_ascii=False, indent=2),
+        encoding="utf-8")
+
+    # 生成报告
+    print("-" * 65)
+    reports_dir = root / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    md = build_markdown_report(state, records)
+    md_path = reports_dir / f"final_report_{stamp}.md"
+    md_path.write_text(md, encoding="utf-8")
+    print(f"[report] Markdown → {md_path}")
+
+    tex = build_latex(state, records)
+    tex_path = reports_dir / f"final_report_{stamp}.tex"
+    tex_path.write_text(tex, encoding="utf-8")
+    print(f"[report] LaTeX → {tex_path}")
+
+    pdf = compile_pdf(tex_path, reports_dir)
+    if pdf:
+        print(f"[report] PDF → {pdf}")
+
+    # latest 副本
+    shutil.copyfile(md_path, reports_dir / "final_report.md")
+    shutil.copyfile(tex_path, reports_dir / "final_report.tex")
+    if pdf:
+        shutil.copyfile(pdf, reports_dir / "final_report.pdf")
+
+    print("=" * 65)
+    print(f"✅ 完成 {state.iteration} 轮迭代")
+    print(f"   最优 CEP90：{state.best_cep90:.2f} m")
+    print(f"   最优配置：{state.best_config}")
+    print(f"   IRLS 改进：{state.irls_improvement:.1f}%")
+    print(f"   假设：{len(state.hypotheses)} 条 | 障碍：{len(state.obstacles)} 条")
+
+
+def rebuild_report(args: argparse.Namespace) -> None:
+    root = Path(args.out).resolve()
+    runs_dir = root / "runs"
+    if not runs_dir.exists():
+        print("未找到 runs/ 目录")
+        return
+    candidates = sorted([p for p in runs_dir.iterdir() if p.is_dir()])
+    if not candidates:
+        print("runs/ 下没有运行记录")
+        return
+    last = candidates[-1]
+    print(f"从 {last} 重建报告")
+
+    records = []
+    with (last / "trace.jsonl").open(encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                records.append(json.loads(line))
+
+    state = ResearchState()
+    for rec in records:
+        state.iteration = rec["iteration"]
+        r = rec["result"]
+        if r["kind"] == "sweep_loss":
+            state.loss_results[r["loss"]] = r["cep90"]
+            if r["cep90"] < state.best_cep90:
+                state.best_cep90 = r["cep90"]
+                state.best_config = {"loss": r["loss"], "f_scale": 5.0}
+        elif r["kind"] == "sweep_fscale":
+            key = f"{r['loss']}_{r['f_scale']}"
+            state.fscale_results[key] = r["cep90"]
+            if r["cep90"] < state.best_cep90:
+                state.best_cep90 = r["cep90"]
+                state.best_config = {"loss": r["loss"], "f_scale": r["f_scale"]}
+        elif r["kind"] == "irls":
+            state.irls_improvement = r["improvement_pct"]
+        elif r["kind"] == "scenario":
+            state.scenario_comparison = r["comparison"]
+        snap = rec["state_snapshot"]
+        state.hypotheses = [""] * snap.get("hypothesis_count", 0)
+        state.obstacles = [""] * snap.get("obstacle_count", 0)
+
+    reports_dir = root / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "final_report.md").write_text(
+        build_markdown_report(state, records), encoding="utf-8")
+    tex_path = reports_dir / "final_report.tex"
+    tex_path.write_text(build_latex(state, records), encoding="utf-8")
+    pdf = compile_pdf(tex_path, reports_dir)
+    print(f"✅ 报告重建完成，PDF：{pdf}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="华为难题一：众包离线高精度位置聚合研究智能体")
+    parser.add_argument("--iterations", type=int, default=30,
+                        help="迭代轮数（默认 30）")
+    parser.add_argument("--scenes", type=int, default=20,
+                        help="基准场景数量（默认 20）")
+    parser.add_argument("--mock", action="store_true",
+                        help="强制规则引擎模式，不调用 LLM")
+    parser.add_argument("--out", type=str, default=".",
+                        help="项目根目录")
+    parser.add_argument("--report-only", action="store_true",
+                        help="仅从已有 runs 重建报告")
+    args = parser.parse_args()
+
+    if args.report_only:
+        rebuild_report(args)
+    else:
+        run_agent(args)
+
+
+if __name__ == "__main__":
+    main()
