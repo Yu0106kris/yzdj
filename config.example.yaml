@@ -1,0 +1,12 @@
+meta:
+  kernels: ["huber", "cauchy", "tukey", "geman_mcclure"]
+  max_irls_iter: 50
+  tol: 1.0e-4
+  scale_multipliers: [1.5, 2.0, 3.0]
+
+scene_gate:
+  residual_mad_ratio_threshold: 2.5
+  min_points_static: 5
+
+output:
+  dir: "outputs"
