@@ -1,0 +1,17 @@
+crowdloc-self-iter/
+├── README.md
+├── requirements.txt
+├── config.example.yaml
+├── run_meta_iter.py
+├── crowdloc/
+│   ├── __init__.py
+│   ├── irls.py
+│   ├── robust_kernels.py
+│   ├── scene_gate.py
+│   ├── init.py
+│   ├── metrics.py
+│   └── synth.py
+├── data/
+│   └── .gitkeep
+└── outputs/
+    └── .gitkeep
